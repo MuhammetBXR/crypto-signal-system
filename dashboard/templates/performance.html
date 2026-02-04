@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="performance-page">
+    <h2>🎯 Detaylı Performans Analizi</h2>
+
+    <div class="performance-stats">
+        <div class="big-stats">
+            <div class="big-stat-card">
+                <div class="big-number {% if stats.win_rate >= 50 %}success{% else %}danger{% endif %}">
+                    {{ "%.1f"|format(stats.win_rate) }}%
+                </div>
+                <div class="big-label">Win Rate</div>
+            </div>
+
+            <div class="big-stat-card">
+                <div class="big-number">1:{{ "%.2f"|format(stats.risk_reward) }}</div>
+                <div class="big-label">Risk/Reward</div>
+            </div>
+        </div>
+
+        <div class="detail-stats">
+            <h3>📊 İstatistikler</h3>
+            <div class="detail-grid">
+                <div class="detail-item">
+                    <span class="detail-label">Toplam Sinyal:</span>
+                    <span class="detail-value">{{ stats.total_signals }}</span>
+                </div>
+                <div class="detail-item">
+                    <span class="detail-label">Kapalı İşlem:</span>
+                    <span class="detail-value">{{ stats.total_wins + stats.total_losses }}</span>
+                </div>
+                <div class="detail-item">
+                    <span class="detail-label">Açık Pozisyon:</span>
+                    <span class="detail-value">{{ stats.open_signals }}</span>
+                </div>
+                <div class="detail-item">
+                    <span class="detail-label">Kazanan:</span>
+                    <span class="detail-value success">{{ stats.total_wins }}</span>
+                </div>
+                <div class="detail-item">
+                    <span class="detail-label">Kaybeden:</span>
+                    <span class="detail-value danger">{{ stats.total_losses }}</span>
+                </div>
+                <div class="detail-item">
+                    <span class="detail-label">Ortalama Kâr:</span>
+                    <span class="detail-value success">+{{ "%.2f"|format(stats.avg_profit) }}%</span>
+                </div>
+                <div class="detail-item">
+                    <span class="detail-label">Ortalama Zarar:</span>
+                    <span class="detail-value danger">-{{ "%.2f"|format(stats.avg_loss) }}%</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="evaluation">
+            <h3>💡 Değerlendirme</h3>
+            {% if stats.win_rate >= 60 %}
+            <p class="eval-text success">🔥 Mükemmel performans! Sistem çok iyi çalışıyor.</p>
+            {% elif stats.win_rate >= 50 %}
+            <p class="eval-text success">✅ İyi performans. Sistem başarılı.</p>
+            {% elif stats.win_rate >= 40 %}
+            <p class="eval-text warning">⚠️ Orta performans. İyileştirme gerekebilir.</p>
+            {% else %}
+            <p class="eval-text danger">❌ Düşük performans. Strateji gözden geçirilmeli.</p>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}

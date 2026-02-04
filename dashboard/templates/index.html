@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="dashboard">
+    <h2>📊 Sistem Durumu</h2>
+    <p class="timestamp">Son Güncelleme: {{ current_time.strftime('%Y-%m-%d %H:%M:%S') }}</p>
+
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-icon">📊</div>
+            <div class="stat-value">{{ stats.total_signals }}</div>
+            <div class="stat-label">Toplam Sinyal</div>
+        </div>
+
+        <div class="stat-card">
+            <div class="stat-icon">⏳</div>
+            <div class="stat-value">{{ stats.open_signals }}</div>
+            <div class="stat-label">Açık Pozisyon</div>
+        </div>
+
+        <div class="stat-card success">
+            <div class="stat-icon">✅</div>
+            <div class="stat-value">{{ stats.total_wins }}</div>
+            <div class="stat-label">Kazanan</div>
+        </div>
+
+        <div class="stat-card danger">
+            <div class="stat-icon">❌</div>
+            <div class="stat-value">{{ stats.total_losses }}</div>
+            <div class="stat-label">Kaybeden</div>
+        </div>
+    </div>
+
+    <div class="performance-summary">
+        <h3>📈 Performans Özeti</h3>
+        <div class="perf-grid">
+            <div class="perf-item">
+                <span class="perf-label">Win Rate:</span>
+                <span class="perf-value {% if stats.win_rate >= 50 %}success{% else %}danger{% endif %}">
+                    {{ "%.1f"|format(stats.win_rate) }}%
+                </span>
+            </div>
+            <div class="perf-item">
+                <span class="perf-label">Ortalama Kâr:</span>
+                <span class="perf-value success">+{{ "%.2f"|format(stats.avg_profit) }}%</span>
+            </div>
+            <div class="perf-item">
+                <span class="perf-label">Ortalama Zarar:</span>
+                <span class="perf-value danger">-{{ "%.2f"|format(stats.avg_loss) }}%</span>
+            </div>
+            <div class="perf-item">
+                <span class="perf-label">Risk/Reward:</span>
+                <span class="perf-value">1:{{ "%.2f"|format(stats.risk_reward) }}</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="system-status">
+        <h3>🔄 Sistem Bilgisi</h3>
+        <p>✅ Sistem aktif ve çalışıyor</p>
+        <p>📡 446 USDT paritesi izleniyor</p>
+        <p>⏱️ Tarama: Her 5 dakikada bir</p>
+    </div>
+</div>
+{% endblock %}

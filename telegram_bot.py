@@ -50,55 +50,32 @@ class TelegramNotifier:
             strength = "ORTA GÜÇLÜ"
             stars = "⭐⭐"
         
-        message = f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{emoji} {action_tr} ({strength})
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        message = f"""<b>{emoji} {action_tr} | {signal.symbol}</b>
+───────────────────
+<b>� GİRİŞ:</b> ${signal.price:,.4f}
+<b>🎯 HEDEF:</b> ${signal.target:,.4f}
+<b>🛡️ STOP:</b> ${signal.stop_loss:,.4f}
 
-💎 COİN: {signal.symbol}
-💰 ŞU ANKİ FİYAT: ${signal.price:,.4f}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 FİYAT SEVİYELERİ
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-🟢 GİRİŞ FİYATI: ${signal.price:,.4f}
-🎯 KÂR AL (HEDEF): ${signal.target:,.4f}
-🛡️ ZARAR KES (STOP): ${signal.stop_loss:,.4f}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 SİNYAL GÜCÜ
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-⚡ Confluence Skoru: {signal.confluence_score}/5 {stars}
-   └─ {signal.confluence_score} strateji aynı yönde sinyal veriyor
-   └─ {strength}! ({"daha güvenilir" if signal.confluence_score >= 3 else "dikkatli ol"})
-
-⭐ Güven Seviyesi: {signal.confidence*100:.0f}%
-
-⏰ Zaman Dilimleri: {signal.timeframe}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🔍 NEDEN BU SİNYALİ VERDİ?
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
+<b>📊 SİNYAL GÜCÜ:</b> {stars} ({signal.confluence_score}/5)
+<b>🔥 GÜVEN:</b> %{signal.confidence*100:.0f}
+<b>⏰ VADE:</b> {signal.timeframe}
+───────────────────
+<b>🔍 ANALİZ ÖZETİ:</b>
 """
         
         # Add strategy details
         for i, (strategy, reason) in enumerate(zip(signal.strategies, signal.reasons), 1):
-            # Parse reason to make it more readable
             reason_text = self._format_reason(reason, signal.direction)
-            message += f"📌 Strateji #{i}: {strategy}\n{reason_text}\n\n"
-        
+            message += f"• {strategy}\n{reason_text}\n"
         
         # Add TradingView chart link
         from chart_generator import ChartGenerator
         chart_gen = ChartGenerator()
         chart_link = chart_gen.get_tradingview_chart_link(signal.symbol)
         
-        message += f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 Chart: {chart_link}
-📱 Sinyali takip et: #{''.join(signal.symbol.split('/'))}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+        message += f"""───────────────────
+� <b>Grafik:</b> <a href="{chart_link}">TradingView</a>
+📱 <b>Takip:</b> #{''.join(signal.symbol.split('/'))}"""
         
         return message
     
@@ -133,6 +110,15 @@ class TelegramNotifier:
         elif "Channel" in reason:
             return f"   ├─ Kanal kırılması algılandı! 📈\n   └─ → Trend değişimi başladı"
         
+        elif "MACD" in reason:
+            return f"   ├─ MACD kesişimi gerçekleşti! 📊\n   └─ → Momentum güçleniyor"
+            
+        elif "Bollinger" in reason:
+            return f"   ├─ Bollinger bandı kırıldı! 🚀\n   └─ → Volatilite artışı"
+
+        elif "MTF" in reason:
+            return f"   ├─ Çoklu zaman dilimi onayı! 💎\n   └─ → Yüksek güvenilirlik"
+            
         # Default formatting
         return f"   └─ {reason}"
     
@@ -146,7 +132,8 @@ class TelegramNotifier:
             await self.bot.send_message(
                 chat_id=self.chat_id,
                 text=message,
-                parse_mode='HTML'
+                parse_mode='HTML',
+                disable_web_page_preview=True
             )
             return True
         except TelegramError as e:

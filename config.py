@@ -30,6 +30,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 # Binance settings (public API - no auth needed for OHLCV)
 EXCHANGE_ID = "binance"
 BASE_CURRENCY = "USDT"
+MARKET_FILTER_SYMBOL = "BTC/USDT"  # Symbol used for market trend filtering
 
 # Timeframes to analyze
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
@@ -77,6 +78,16 @@ STRATEGY_PARAMS = {
         "proximity_threshold": 0.005,  # Price within 0.5% of level
         "min_touches": 2,  # Min touches to confirm level
         "breakout_volume_multiplier": 1.3,
+    },
+    "macd": {
+        "fast_period": 12,
+        "slow_period": 26,
+        "signal_period": 9,
+    },
+    "bollinger_bands": {
+        "period": 20,
+        "std_dev": 2.0,
+        "squeeze_threshold": 0.05,  # 5% band width threshold for squeeze
     },
 }
 

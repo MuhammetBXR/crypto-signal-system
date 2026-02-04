@@ -13,7 +13,10 @@ from strategies.rsi_divergence import RSIDivergenceStrategy
 from strategies.volume_spike import VolumeSpikeStrategy
 from strategies.ema_cross import EMACrossStrategy
 from strategies.support_resistance import SupportResistanceStrategy
+from strategies.macd_conf import MACDStrategy
+from strategies.bollinger_bands import BollingerBandsStrategy
 import config
+from ta.trend import EMAIndicator
 
 
 @dataclass
@@ -56,6 +59,8 @@ class SignalEngine:
             VolumeSpikeStrategy(),
             EMACrossStrategy(),
             SupportResistanceStrategy(),
+            MACDStrategy(),
+            BollingerBandsStrategy(),
         ]
         logger.info(f"Initialized {len(self.strategies)} strategies")
     
@@ -74,6 +79,9 @@ class SignalEngine:
         Returns:
             List of confluent signals
         """
+        # 1. Market Structure Filter (Global Trend)
+        market_trend = self._get_market_trend(data)
+        
         all_signals = []
         
         # Run each strategy on each timeframe
@@ -85,14 +93,46 @@ class SignalEngine:
                 try:
                     signal = strategy.analyze(df, symbol, timeframe)
                     if signal:
-                        all_signals.append(signal)
+                        # 2. Filter signal based on market trend
+                        if self._is_aligned_with_market(signal, market_trend):
+                            all_signals.append(signal)
+                        else:
+                            logger.info(f"Filtered {signal.direction} signal for {symbol} due to market trend mismatch ({market_trend})")
                 except Exception as e:
                     logger.error(f"Error in {strategy.name} for {symbol} {timeframe}: {e}")
         
-        # Calculate confluence
+        # 3. Calculate confluence and MTF
         confluent_signals = self._calculate_confluence(all_signals)
         
         return confluent_signals
+
+    def _get_market_trend(self, data: Dict[str, pd.DataFrame]) -> str:
+        """Determine global market trend using BTC (if available) or current symbol"""
+        # In a real scenario, we'd fetch BTC/USDT specifically. 
+        # For now, let's look at the highest timeframe available (1d or 4h)
+        for tf in ['1d', '4h']:
+            if tf in data and len(data[tf]) > 200:
+                df = data[tf]
+                ema200 = EMAIndicator(close=df['close'], window=200).ema_indicator()
+                current_price = df['close'].iloc[-1]
+                current_ema = ema200.iloc[-1]
+                
+                if current_price > current_ema:
+                    return 'BULLISH'
+                else:
+                    return 'BEARISH'
+        
+        return 'NEUTRAL'
+
+    def _is_aligned_with_market(self, signal: Signal, market_trend: str) -> bool:
+        """Check if signal direction aligns with global market trend"""
+        if market_trend == 'NEUTRAL':
+            return True
+        if market_trend == 'BULLISH' and signal.direction == 'BUY':
+            return True
+        if market_trend == 'BEARISH' and signal.direction == 'SELL':
+            return True
+        return False
     
     def _calculate_confluence(self, signals: List[Signal]) -> List[ConfluentSignal]:
         """Group signals by direction and calculate confluence"""
@@ -133,19 +173,24 @@ class SignalEngine:
         avg_stop_loss = sum(s.stop_loss for s in signals) / len(signals)
         avg_confidence = sum(s.confidence for s in signals) / len(signals)
         
-        # Collect reasons
-        reasons = [s.reason for s in signals]
+        # Check for MTF (Multiple Timeframe Confirmation)
+        is_mtf = len(timeframes) >= 2
         
+        merged_confidence = avg_confidence
+        if is_mtf:
+            merged_confidence = min(1.0, avg_confidence + 0.1)  # Bonus for MTF
+            reasons.append(f"MTF Confirmation ({', '.join(timeframes)})")
+            
         return ConfluentSignal(
             symbol=signals[0].symbol,
             timeframe=', '.join(sorted(timeframes)),
-            strategies=strategy_details,  # Use detailed list instead of unique names
+            strategies=strategy_details,
             direction=direction,
             price=avg_price,
             target=avg_target,
             stop_loss=avg_stop_loss,
             confluence_score=len(signals),
-            confidence=avg_confidence,
+            confidence=merged_confidence,
             reasons=reasons
         )
     

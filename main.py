@@ -1,283 +1,232 @@
 """
-Main application - Crypto Signal System
+Crypto Signal Bot - Ana Döngü
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Çalışma akışı:
+1. Binance'ten tüm USDT paritelerini çek (hacme göre filtrele)
+2. Her 5 dakikada bir tüm coinleri analiz et
+3. Confluence sinyalleri konsola yaz + Telegram'a gönder (token varsa)
+4. Aynı coin için cooldown süresi dolmadan tekrar sinyal verme
+
+Kullanım:
+    python main.py
+    python main.py --once     # Tek seferlik çalış ve çık
+    python main.py --symbol BTC/USDT  # Tek coin test et
 """
+from __future__ import annotations
+
+import argparse
+import logging
 import time
-import signal
-import sys
-from datetime import datetime
-from loguru import logger
+from datetime import datetime, timedelta
+from typing import Dict, List
 
-from data_fetcher import DataFetcher
-from signal_engine import SignalEngine
-from telegram_bot import TelegramNotifier
-from database import DatabaseManager
 import config
+from data_fetcher import DataFetcher
+from signal_engine import SignalEngine, FinalSignal
 
-# Configure logger
-logger.remove()
-logger.add(
-    sys.stderr,
-    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>",
-    level=config.LOG_LEVEL
+# ── Logging ────────────────────────────────────────────────────
+logging.basicConfig(
+    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(config.LOG_FILE, encoding="utf-8"),
+    ],
 )
-logger.add(
-    config.LOGS_DIR / "crypto_signals_{time:YYYY-MM-DD}.log",
-    rotation="1 day",
-    retention="7 days",
-    level=config.LOG_LEVEL,
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function} - {message}"
-)
+logger = logging.getLogger("main")
+
+# ── Telegram (isteğe bağlı) ────────────────────────────────────
+_telegram_available = False
+if config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID:
+    try:
+        import requests
+        _telegram_available = True
+        logger.info("Telegram entegrasyonu aktif")
+    except ImportError:
+        logger.warning("requests kütüphanesi yok, Telegram devre dışı")
 
 
-class CryptoSignalSystem:
-    """Main system orchestrator"""
-    
+def send_telegram(text: str) -> None:
+    """Telegram'a mesaj gönder (opsiyonel)"""
+    if not _telegram_available:
+        return
+    import requests
+    url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={
+            "chat_id": config.TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+        }, timeout=10)
+    except Exception as exc:
+        logger.warning(f"Telegram gönderim hatası: {exc}")
+
+
+def format_telegram_message(sig: FinalSignal) -> str:
+    """Telegram için HTML formatlı mesaj"""
+    direction_icon = "🟢 LONG/BUY" if sig.direction == "BUY" else "🔴 SHORT/SELL"
+    mtf = " | MTF ✅" if sig.is_mtf else ""
+    tf_str = "+".join(sorted(set(sig.timeframes)))
+    pct_tp = (sig.target - sig.price) / sig.price * 100
+    pct_sl = (sig.stop_loss - sig.price) / sig.price * 100
+    reasons_str = "\n".join(f"  • {r}" for r in sig.reasons)
+
+    return (
+        f"<b>{direction_icon}</b>  |  <b>{sig.symbol}</b>  [{tf_str}{mtf}]\n"
+        f"\n"
+        f"📌 Giriş   : <code>{sig.price:.6g}</code>\n"
+        f"🎯 Hedef   : <code>{sig.target:.6g}</code>  ({pct_tp:+.2f}%)\n"
+        f"🛑 Stop    : <code>{sig.stop_loss:.6g}</code>  ({pct_sl:+.2f}%)\n"
+        f"\n"
+        f"📊 Confluence : {sig.confluence} strateji\n"
+        f"💯 Skor       : {sig.final_score:.0%}\n"
+        f"🔧 Stratejiler: {', '.join(sig.strategies)}\n"
+        f"\n"
+        f"📝 Sebepler:\n{reasons_str}\n"
+        f"\n"
+        f"⏰ {sig.timestamp.strftime('%H:%M:%S UTC')}"
+    )
+
+
+class Bot:
     def __init__(self):
-        logger.info("=== Initializing Crypto Signal System ===")
-        
-        self.data_fetcher = DataFetcher()
-        self.signal_engine = SignalEngine()
-        self.telegram = TelegramNotifier()
-        self.db = DatabaseManager()
-        
-        self.running = False
-        self.cycle_count = 0
-        
-        # Setup graceful shutdown
-        signal.signal(signal.SIGINT, self.shutdown)
-        signal.signal(signal.SIGTERM, self.shutdown)
-        
-        logger.info("System initialized successfully")
-    
-    def shutdown(self, signum, frame):
-        """Graceful shutdown"""
-        logger.warning("Shutdown signal received. Stopping...")
-        self.running = False
-        sys.exit(0)
-    
-    def run_cycle(self):
-        """Run one analysis cycle"""
-        self.cycle_count += 1
-        cycle_start = time.time()
-        
-        logger.info(f"\n{'='*60}")
-        logger.info(f"CYCLE #{self.cycle_count} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        logger.info(f"{'='*60}")
-        
-        try:
-            # 1. Fetch data
-            logger.info("Step 1: Fetching market data...")
-            all_data = self.data_fetcher.fetch_all_pairs_data()
-            
-            if not all_data:
-                logger.warning("No data fetched. Skipping cycle.")
-                return
-            
-            logger.info(f"Fetched data for {len(all_data)} pairs")
-            
-            # 2. Analyze for signals
-            logger.info("Step 2: Analyzing signals...")
-            signals = self.signal_engine.analyze_all(all_data)
-            
-            logger.info(f"Found {len(signals)} potential signals")
-            
-            # 3. Filter signals (cooldown, max per cycle)
-            logger.info("Step 3: Filtering signals...")
-            filtered_signals = self.filter_signals(signals)
-            
-            logger.info(f"After filtering: {len(filtered_signals)} signals")
-            
-            # 4. Save to database and send notifications
-            if filtered_signals:
-                logger.info("Step 4: Saving signals and sending notifications...")
-                self.process_signals(filtered_signals)
-            else:
-                logger.info("No signals to process")
-            
-            # 5. Update performance tracking
-            logger.info("Step 5: Updating signal performance...")
-            self.update_performance()
-            
-            cycle_duration = time.time() - cycle_start
-            logger.info(f"Cycle completed in {cycle_duration:.1f} seconds")
-            
-        except Exception as e:
-            logger.error(f"Error in cycle: {e}", exc_info=True)
-            self.telegram.send_error_message(f"Cycle error: {str(e)}")
-    
-    def filter_signals(self, signals):
-        """Filter signals based on cooldown and limits"""
-        filtered = []
-        
-        for signal in signals:
-            # Check cooldown
-            if not self.db.can_send_signal(signal.symbol):
-                logger.debug(f"Skipping {signal.symbol} - cooldown active")
-                continue
-            
-            filtered.append(signal)
-            
-            # Check max signals per cycle
-            if len(filtered) >= config.MAX_SIGNALS_PER_CYCLE:
-                logger.warning(f"Reached max signals per cycle ({config.MAX_SIGNALS_PER_CYCLE})")
-                break
-        
-        return filtered
-    
-    def process_signals(self, signals):
-        """Save signals and send notifications"""
-        for signal in signals:
-            try:
-                # Save to database
-                signal_id = self.db.save_signal(signal.to_dict())
-                logger.info(f"Saved signal #{signal_id}: {signal.symbol} {signal.direction}")
-                
-                # Send Telegram notification
-                if self.telegram.send_signal(signal):
-                    logger.info(f"Sent Telegram notification for {signal.symbol}")
-                else:
-                    logger.warning(f"Failed to send Telegram notification for {signal.symbol}")
-                
-                # Small delay between messages
-                time.sleep(0.5)
-                
-            except Exception as e:
-                logger.error(f"Error processing signal for {signal.symbol}: {e}")
-    
-    def update_performance(self):
-        """Update performance for open signals"""
-        try:
-            open_signals = self.db.get_open_signals()
-            
-            for signal in open_signals:
-                # Get current price
-                current_price = self.data_fetcher.get_current_price(signal['symbol'])
-                
-                if not current_price:
-                    continue
-                
-                # Calculate duration
-                from datetime import datetime
-                created_at_str = signal.get('created_at')
-                if created_at_str:
-                    if isinstance(created_at_str, str):
-                        created_at = datetime.fromisoformat(created_at_str)
-                    else:
-                        created_at = created_at_str
-                    duration_hours = (datetime.now() - created_at).total_seconds() / 3600
-                else:
-                    duration_hours = 0
-                
-                # Check if target or stop loss hit
-                if signal['direction'] == 'BUY':
-                    if current_price >= signal['target']:
-                        profit_pct = ((current_price - signal['entry_price']) / signal['entry_price']) * 100
-                        self.db.update_signal_performance(signal['id'], current_price, win=True)
-                        logger.info(f"Signal #{signal['id']} ({signal['symbol']}) HIT TARGET! 🎯")
-                        
-                        # Send Telegram notification
-                        self.telegram.send_target_hit_notification(
-                            signal_id=signal['id'],
-                            symbol=signal['symbol'],
-                            direction=signal['direction'],
-                            entry_price=signal['entry_price'],
-                            target_price=signal['target'],
-                            current_price=current_price,
-                            profit_pct=profit_pct,
-                            duration_hours=duration_hours
-                        )
-                    elif current_price <= signal['stop_loss']:
-                        loss_pct = ((signal['entry_price'] - current_price) / signal['entry_price']) * 100
-                        self.db.update_signal_performance(signal['id'], current_price, win=False)
-                        logger.info(f"Signal #{signal['id']} ({signal['symbol']}) hit stop loss ❌")
-                        
-                        # Send Telegram notification
-                        self.telegram.send_stop_loss_notification(
-                            signal_id=signal['id'],
-                            symbol=signal['symbol'],
-                            direction=signal['direction'],
-                            entry_price=signal['entry_price'],
-                            stop_loss=signal['stop_loss'],
-                            current_price=current_price,
-                            loss_pct=loss_pct,
-                            duration_hours=duration_hours
-                        )
-                else:  # SELL
-                    if current_price <= signal['target']:
-                        profit_pct = ((signal['entry_price'] - current_price) / signal['entry_price']) * 100
-                        self.db.update_signal_performance(signal['id'], current_price, win=True)
-                        logger.info(f"Signal #{signal['id']} ({signal['symbol']}) HIT TARGET! 🎯")
-                        
-                        # Send Telegram notification
-                        self.telegram.send_target_hit_notification(
-                            signal_id=signal['id'],
-                            symbol=signal['symbol'],
-                            direction=signal['direction'],
-                            entry_price=signal['entry_price'],
-                            target_price=signal['target'],
-                            current_price=current_price,
-                            profit_pct=profit_pct,
-                            duration_hours=duration_hours
-                        )
-                    elif current_price >= signal['stop_loss']:
-                        loss_pct = ((current_price - signal['entry_price']) / signal['entry_price']) * 100
-                        self.db.update_signal_performance(signal['id'], current_price, win=False)
-                        logger.info(f"Signal #{signal['id']} ({signal['symbol']}) hit stop loss ❌")
-                        
-                        # Send Telegram notification
-                        self.telegram.send_stop_loss_notification(
-                            signal_id=signal['id'],
-                            symbol=signal['symbol'],
-                            direction=signal['direction'],
-                            entry_price=signal['entry_price'],
-                            stop_loss=signal['stop_loss'],
-                            current_price=current_price,
-                            loss_pct=loss_pct,
-                            duration_hours=duration_hours
-                        )
-                
-        except Exception as e:
-            logger.error(f"Error updating performance: {e}")
-    
-    def run(self):
-        """Main run loop"""
-        logger.info("Starting Crypto Signal System...")
-        
-        # Send startup notification
-        self.telegram.send_startup_message()
-        
-        self.running = True
-        cycle_interval = config.CYCLE_INTERVAL_MINUTES * 60  # Convert to seconds
-        
-        logger.info(f"Running cycles every {config.CYCLE_INTERVAL_MINUTES} minutes")
-        logger.info("Press Ctrl+C to stop\n")
-        
-        while self.running:
-            try:
-                self.run_cycle()
-                
-                # Wait for next cycle
-                logger.info(f"\nWaiting {config.CYCLE_INTERVAL_MINUTES} minutes until next cycle...")
-                time.sleep(cycle_interval)
-                
-            except KeyboardInterrupt:
-                logger.warning("\nKeyboard interrupt received. Shutting down...")
-                break
-            except Exception as e:
-                logger.error(f"Unexpected error: {e}", exc_info=True)
-                time.sleep(60)  # Wait 1 minute before retry
-        
-        logger.info("System stopped")
+        self.fetcher = DataFetcher()
+        self.engine = SignalEngine()
+        # Cooldown takibi: {symbol: datetime}
+        self._last_signal: Dict[str, Dict[str, datetime]] = {}
 
+    def _is_on_cooldown(self, symbol: str, direction: str) -> bool:
+        key = f"{symbol}:{direction}"
+        if key not in self._last_signal:
+            return False
+        elapsed = datetime.utcnow() - self._last_signal[key]
+        return elapsed < timedelta(minutes=config.SIGNAL_COOLDOWN_MINUTES)
+
+    def _mark_signal(self, symbol: str, direction: str) -> None:
+        key = f"{symbol}:{direction}"
+        self._last_signal[key] = datetime.utcnow()
+
+    def run_once(self, symbols: List[str] = None) -> List[FinalSignal]:
+        """Tek bir tarama döngüsü çalıştır"""
+        if symbols is None:
+            symbols = self.fetcher.get_usdt_symbols()
+
+        if not symbols:
+            logger.error("Analiz edilecek sembol bulunamadı!")
+            return []
+
+        logger.info(f"Tarama başladı: {len(symbols)} coin")
+
+        # Veri çek
+        all_data = self.fetcher.fetch_all(symbols)
+
+        # Analiz et
+        signals = self.engine.analyze_batch(all_data)
+
+        # Skora göre sırala (en yüksek önce)
+        signals.sort(key=lambda s: s.final_score, reverse=True)
+
+        # Çıktı
+        published = []
+        for sig in signals:
+            if self._is_on_cooldown(sig.symbol, sig.direction):
+                logger.debug(f"[{sig.symbol}] cooldown aktif, atlanıyor")
+                continue
+
+            # Konsola yaz
+            print(sig.summary())
+            logger.info(
+                f"SİNYAL: {sig.symbol} {sig.direction} "
+                f"@ {sig.price:.6g} | skor={sig.final_score:.0%}"
+            )
+
+            # Telegram
+            if _telegram_available:
+                send_telegram(format_telegram_message(sig))
+
+            self._mark_signal(sig.symbol, sig.direction)
+            published.append(sig)
+
+        if not published:
+            logger.info("Bu döngüde sinyal üretilmedi.")
+        else:
+            logger.info(f"Bu döngüde {len(published)} sinyal yayınlandı.")
+
+        return published
+
+    def run_loop(self, symbols: List[str] = None) -> None:
+        """Sürekli döngü: her CYCLE_INTERVAL_SECONDS saniyede bir tara"""
+        logger.info(
+            f"Bot başlatıldı | Döngü: {config.CYCLE_INTERVAL_SECONDS}sn | "
+            f"Confluence: {config.MIN_CONFLUENCE}+"
+        )
+        print(f"\n{'='*60}")
+        print(f"  CRYPTO SIGNAL BOT")
+        print(f"  Tarama aralığı : {config.CYCLE_INTERVAL_SECONDS // 60} dakika")
+        print(f"  Zaman dilimleri: {', '.join(config.TIMEFRAMES)}")
+        print(f"  Min confluence : {config.MIN_CONFLUENCE} strateji")
+        print(f"  Çıkmak için    : Ctrl+C")
+        print(f"{'='*60}\n")
+
+        cycle = 0
+        while True:
+            cycle += 1
+            start = time.time()
+            logger.info(f"── Döngü #{cycle} başladı ──")
+
+            try:
+                self.run_once(symbols)
+            except KeyboardInterrupt:
+                logger.info("Bot durduruldu (Ctrl+C)")
+                break
+            except Exception as exc:
+                logger.error(f"Döngü hatası: {exc}", exc_info=True)
+
+            elapsed = time.time() - start
+            wait = max(0, config.CYCLE_INTERVAL_SECONDS - elapsed)
+            logger.info(
+                f"── Döngü #{cycle} bitti ({elapsed:.0f}sn) | "
+                f"Sonraki: {wait:.0f}sn ──"
+            )
+
+            try:
+                time.sleep(wait)
+            except KeyboardInterrupt:
+                logger.info("Bot durduruldu (Ctrl+C)")
+                break
+
+
+# ── Entry point ────────────────────────────────────────────────
 
 def main():
-    """Entry point"""
-    try:
-        system = CryptoSignalSystem()
-        system.run()
-    except Exception as e:
-        logger.critical(f"Fatal error: {e}", exc_info=True)
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Crypto Signal Bot")
+    parser.add_argument(
+        "--once", action="store_true",
+        help="Tek seferlik tara ve çık"
+    )
+    parser.add_argument(
+        "--symbol", type=str, default=None,
+        help="Tek bir sembol test et (ör: BTC/USDT)"
+    )
+    args = parser.parse_args()
+
+    bot = Bot()
+
+    symbols = None
+    if args.symbol:
+        symbols = [args.symbol]
+        logger.info(f"Tek sembol modu: {args.symbol}")
+
+    if args.once or args.symbol:
+        signals = bot.run_once(symbols)
+        if signals:
+            print(f"\n{'='*60}")
+            print(f"Toplam {len(signals)} sinyal üretildi.")
+        else:
+            print("Sinyal üretilmedi.")
+    else:
+        bot.run_loop(symbols)
 
 
 if __name__ == "__main__":

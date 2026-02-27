@@ -1,106 +1,107 @@
 """
-Base strategy class - All strategies inherit from this
+Base strategy - Tüm stratejiler bu sınıftan türetilir
 """
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 import pandas as pd
+import numpy as np
 
 
 @dataclass
 class Signal:
-    """Signal dataclass"""
+    """
+    Tek bir strateji tarafından üretilen sinyal.
+    direction: 'BUY' (dip bölgede al) veya 'SHORT' (tepe bölgede sat)
+    score    : 1-10 arası güven skoru
+    """
     symbol: str
     timeframe: str
     strategy: str
-    direction: str  # 'BUY' or 'SELL'
+    direction: str          # 'BUY' veya 'SHORT'
     price: float
     target: float
     stop_loss: float
-    confidence: float  # 0.0 - 1.0
+    score: float            # 0.0 – 1.0
     reason: str
-    timestamp: datetime = None
-    
-    def __post_init__(self):
-        if self.timestamp is None:
-            self.timestamp = datetime.utcnow()
-    
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+
     def to_dict(self) -> dict:
-        """Convert to dictionary for database storage"""
         return {
-            'symbol': self.symbol,
-            'timeframe': self.timeframe,
-            'strategies': [self.strategy],  # Will be merged in confluence
-            'direction': self.direction,
-            'entry_price': self.price,
-            'target': self.target,
-            'stop_loss': self.stop_loss,
-            'confidence_score': 1,  # Initial score, will be updated
-            'reason': self.reason,
+            "symbol": self.symbol,
+            "timeframe": self.timeframe,
+            "strategy": self.strategy,
+            "direction": self.direction,
+            "price": self.price,
+            "target": self.target,
+            "stop_loss": self.stop_loss,
+            "score": self.score,
+            "reason": self.reason,
+            "timestamp": self.timestamp.isoformat(),
         }
 
 
 class BaseStrategy(ABC):
-    """Abstract base class for all trading strategies"""
-    
-    def __init__(self, params: dict = None):
-        self.params = params or {}
+    """Soyut taban sınıf"""
+
+    def __init__(self):
         self.name = self.__class__.__name__
-    
+
     @abstractmethod
     def analyze(self, df: pd.DataFrame, symbol: str, timeframe: str) -> Optional[Signal]:
         """
-        Analyze data and return signal if conditions are met
-        
-        Args:
-            df: OHLCV DataFrame with columns [open, high, low, close, volume]
-            symbol: Trading pair symbol (e.g., BTC/USDT)
-            timeframe: Timeframe string (e.g., '1h')
-        
-        Returns:
-            Signal object if conditions are met, None otherwise
+        OHLCV DataFrame'i analiz eder, sinyal varsa döner.
+        df sütunları: open, high, low, close, volume (hepsi float)
         """
         pass
-    
-    def get_name(self) -> str:
-        """Get strategy name"""
-        return self.name
-    
-    def calculate_target_stop(
+
+    # ── Yardımcı metotlar ─────────────────────────────────
+
+    def calc_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Average True Range hesapla"""
+        high = df["high"]
+        low = df["low"]
+        close = df["close"]
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+        return tr.ewm(span=period, adjust=False).mean()
+
+    def calc_tp_sl(
         self,
-        entry_price: float,
+        entry: float,
         direction: str,
-        atr: float = None,
-        rr_ratio: float = 2.0,
-        stop_percent: float = 1.5
-    ) -> tuple:
+        atr: float,
+        rr: float = 2.0,
+        atr_mult: float = 1.5
+    ) -> tuple[float, float]:
         """
-        Calculate target and stop loss prices
-        
-        Args:
-            entry_price: Entry price
-            direction: 'BUY' or 'SELL'
-            atr: Average True Range (optional, for dynamic stops)
-            rr_ratio: Risk-Reward ratio
-            stop_percent: Stop loss percentage
-        
-        Returns:
-            (target_price, stop_loss_price)
+        ATR'ye göre Take Profit ve Stop Loss hesapla.
+        Returns: (target, stop_loss)
         """
-        if direction == 'BUY':
-            if atr:
-                stop_loss = entry_price - (atr * 1.5)
-                target = entry_price + (atr * 1.5 * rr_ratio)
-            else:
-                stop_loss = entry_price * (1 - stop_percent / 100)
-                target = entry_price * (1 + (stop_percent * rr_ratio) / 100)
-        else:  # SELL
-            if atr:
-                stop_loss = entry_price + (atr * 1.5)
-                target = entry_price - (atr * 1.5 * rr_ratio)
-            else:
-                stop_loss = entry_price * (1 + stop_percent / 100)
-                target = entry_price * (1 - (stop_percent * rr_ratio) / 100)
-        
-        return round(target, 8), round(stop_loss, 8)
+        sl_dist = atr * atr_mult
+        tp_dist = sl_dist * rr
+        if direction == "BUY":
+            return round(entry + tp_dist, 8), round(entry - sl_dist, 8)
+        else:  # SHORT
+            return round(entry - tp_dist, 8), round(entry + sl_dist, 8)
+
+    def find_swing_lows(self, arr: np.ndarray, window: int = 3) -> list:
+        """Lokal minimum noktaları bul"""
+        lows = []
+        for i in range(window, len(arr) - window):
+            if arr[i] == arr[i - window:i + window + 1].min():
+                lows.append((i, arr[i]))
+        return lows
+
+    def find_swing_highs(self, arr: np.ndarray, window: int = 3) -> list:
+        """Lokal maksimum noktaları bul"""
+        highs = []
+        for i in range(window, len(arr) - window):
+            if arr[i] == arr[i - window:i + window + 1].max():
+                highs.append((i, arr[i]))
+        return highs

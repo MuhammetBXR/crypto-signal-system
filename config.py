@@ -1,100 +1,72 @@
 """
-Central configuration for Crypto Signal System
+Crypto Signal Bot - Konfigürasyon
+Amaç: Tepe bölgede SHORT, dip bölgede BUY sinyali üretmek
 """
 import os
-from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
-# Project paths
-PROJECT_ROOT = Path(__file__).parent
-CHARTS_DIR = PROJECT_ROOT / "charts"
-LOGS_DIR = PROJECT_ROOT / "logs"
+# ── Exchange ──────────────────────────────────────────────
+EXCHANGE_ID = "binance"
+BASE_CURRENCY = "USDT"
 
-# Create directories if they don't exist
-CHARTS_DIR.mkdir(exist_ok=True)
-LOGS_DIR.mkdir(exist_ok=True)
-
-# Telegram settings
+# ── Telegram ──────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Database settings
-DATABASE_PATH = os.getenv("DATABASE_PATH", "./crypto_signals.db")
+# ── Tarama ayarları ───────────────────────────────────────
+TIMEFRAMES = ["15m", "1h", "4h"]          # Analiz edilecek zaman dilimleri
+OHLCV_LIMIT = 250                          # Her timeframe için çekilecek mum sayısı
+CYCLE_INTERVAL_SECONDS = 300               # 5 dakikada bir tara
+MAX_CONCURRENT_SYMBOLS = 20               # Aynı anda kaç coin paralel analiz edilsin
+RATE_LIMIT_DELAY = 0.1                     # İstekler arası bekleme (sn)
 
-# Logging settings
+# Coin filtresi: sadece yüksek hacimli coin tara
+MIN_QUOTE_VOLUME_USDT = 5_000_000          # Son 24s hacim >= 5M USDT
+TOP_N_SYMBOLS = 100                        # En yüksek hacimli kaç coin
+
+# ── Sinyal eşikleri ───────────────────────────────────────
+# Confluence: kaç strateji aynı anda aynı yönde sinyal vermeli
+MIN_CONFLUENCE = 2                         # En az 2 strateji aynı fikirde olmalı
+MTF_BONUS = True                           # Farklı timeframe'lerde eşleşme bonus puan verir
+
+# Cooldown: aynı coin için tekrar sinyal verme süresi (dakika)
+SIGNAL_COOLDOWN_MINUTES = 60
+
+# ── RSI ayarları ──────────────────────────────────────────
+RSI_PERIOD = 14
+RSI_OVERSOLD = 30          # BUY bölgesi
+RSI_OVERBOUGHT = 70        # SHORT bölgesi
+RSI_EXTREME_OVERSOLD = 20  # Ekstra güçlü BUY
+RSI_EXTREME_OVERBOUGHT = 80 # Ekstra güçlü SHORT
+
+# ── Stochastic RSI ────────────────────────────────────────
+STOCH_RSI_PERIOD = 14
+STOCH_K_PERIOD = 3
+STOCH_D_PERIOD = 3
+STOCH_OVERSOLD = 20
+STOCH_OVERBOUGHT = 80
+
+# ── Bollinger Bands ───────────────────────────────────────
+BB_PERIOD = 20
+BB_STD = 2.0
+BB_SQUEEZE_THRESHOLD = 0.03   # Bant genişliği < %3 → sıkışma
+
+# ── RSI Divergence ────────────────────────────────────────
+DIV_LOOKBACK = 30             # Kaç mumda divergence ara
+DIV_MIN_SWING = 0.02          # Minimum %2 fiyat hareketi
+DIV_SWING_WINDOW = 3          # Swing high/low tespit penceresi
+
+# ── Volume ────────────────────────────────────────────────
+VOL_MA_PERIOD = 20
+VOL_SPIKE_MULTIPLIER = 1.5    # Ortalamanın 1.5 katı hacim = onay
+
+# ── Risk / Ödül ───────────────────────────────────────────
+DEFAULT_RR = 2.0              # Risk/Ödül oranı (1 risk → 2 kazanç)
+DEFAULT_STOP_PCT = 1.5        # Stop loss %1.5
+ATR_PERIOD = 14               # ATR tabanlı dinamik SL için
+
+# ── Loglama ───────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-
-# Binance settings (public API - no auth needed for OHLCV)
-EXCHANGE_ID = "binance"
-BASE_CURRENCY = "USDT"
-MARKET_FILTER_SYMBOL = "BTC/USDT"  # Symbol used for market trend filtering
-
-# Timeframes to analyze
-TIMEFRAMES = ["15m", "1h", "4h", "1d"]
-
-# Data fetching settings
-OHLCV_LIMIT = 100  # Number of candles to fetch per request
-RATE_LIMIT_DELAY = 0.05  # Delay between requests in seconds
-MAX_CONCURRENT_REQUESTS = 20  # Max parallel requests
-
-# Signal settings
-MIN_CONFLUENCE_SCORE = int(os.getenv("MIN_CONFLUENCE_SCORE", "2"))
-SIGNAL_COOLDOWN_HOURS = 1  # Min hours between signals for same coin
-MAX_SIGNALS_PER_CYCLE = 50  # Max signals to send per cycle
-
-# Cycle settings
-CYCLE_INTERVAL_MINUTES = int(os.getenv("CYCLE_INTERVAL_MINUTES", "5"))
-
-# Strategy parameters
-STRATEGY_PARAMS = {
-    "channel_breakout": {
-        "lookback_period": 50,
-        "volume_multiplier": 1.5,  # Breakout volume must be 1.5x average
-        "min_channel_width": 0.02,  # Min 2% channel width
-    },
-    "rsi_divergence": {
-        "rsi_period": 14,
-        "rsi_overbought": 70,
-        "rsi_oversold": 30,
-        "divergence_lookback": 20,
-        "min_price_swing": 0.03,  # Min 3% price swing for divergence
-    },
-    "volume_spike": {
-        "volume_period": 20,
-        "spike_multiplier": 2.0,  # Volume must be 2x average
-        "min_candle_body": 0.01,  # Min 1% candle body (avoid doji)
-    },
-    "ema_cross": {
-        "fast_period": 50,
-        "slow_period": 200,
-        "adx_period": 14,
-        "min_adx": 25,  # Trend strength filter
-    },
-    "support_resistance": {
-        "swing_lookback": 20,
-        "proximity_threshold": 0.005,  # Price within 0.5% of level
-        "min_touches": 2,  # Min touches to confirm level
-        "breakout_volume_multiplier": 1.3,
-    },
-    "macd": {
-        "fast_period": 12,
-        "slow_period": 26,
-        "signal_period": 9,
-    },
-    "bollinger_bands": {
-        "period": 20,
-        "std_dev": 2.0,
-        "squeeze_threshold": 0.05,  # 5% band width threshold for squeeze
-    },
-}
-
-# Risk management
-DEFAULT_RISK_REWARD_RATIO = 2.0  # Target is 2x stop loss distance
-DEFAULT_STOP_LOSS_PERCENT = 1.5  # 1.5% stop loss
-
-# Performance tracking
-BACKTEST_DAYS = 90  # Days of historical data for backtesting
-PERFORMANCE_REVIEW_HOURS = 24  # Hours to wait before marking signal as win/loss
+LOG_FILE = "signals.log"

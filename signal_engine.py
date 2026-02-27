@@ -1,239 +1,201 @@
 """
-Signal Engine - Runs all strategies and combines signals
+Signal Engine - MTF Confluence Motoru
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Her coin için:
+1. 4 strateji × 3 timeframe = 12 potansiyel sinyal çalıştırılır
+2. Aynı yöndeki sinyaller toplanır (confluence)
+3. Farklı timeframe'lerden geliyorsa MTF bonusu eklenir
+4. MIN_CONFLUENCE eşiğini geçenler FinalSignal olarak döner
+
+Skor sistemi:
+- Her strateji 0.0-1.0 arası skor döner
+- Confluence skoru = strateji sayısı × ortalama skor × MTF çarpanı
+- Eşik: MIN_CONFLUENCE strateji sayısı
 """
-from typing import List, Dict, Optional
+from __future__ import annotations
+
+import logging
 from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Dict, List, Optional
 import pandas as pd
-from loguru import logger
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from strategies.base_strategy import Signal
-from strategies.channel_breakout import ChannelBreakoutStrategy
-from strategies.rsi_divergence import RSIDivergenceStrategy
-from strategies.volume_spike import VolumeSpikeStrategy
-from strategies.ema_cross import EMACrossStrategy
-from strategies.support_resistance import SupportResistanceStrategy
-from strategies.macd_conf import MACDStrategy
+from strategies.rsi_stoch import RSIStochStrategy
 from strategies.bollinger_bands import BollingerBandsStrategy
+from strategies.rsi_divergence import RSIDivergenceStrategy
+from strategies.volume_confirm import VolumeConfirmStrategy
 import config
-from ta.trend import EMAIndicator
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
-class ConfluentSignal:
-    """Signal with confluence from multiple strategies"""
+class FinalSignal:
+    """
+    Birden fazla stratejinin onayladığı nihai sinyal.
+    """
     symbol: str
-    timeframe: str
-    strategies: List[str]
-    direction: str
+    direction: str          # 'BUY' veya 'SHORT'
     price: float
     target: float
     stop_loss: float
-    confluence_score: int
-    confidence: float
-    reasons: List[str]
-    
-    def to_dict(self) -> dict:
-        """Convert to database format"""
-        return {
-            'symbol': self.symbol,
-            'timeframe': self.timeframe,
-            'strategies': self.strategies,
-            'direction': self.direction,
-            'entry_price': self.price,
-            'target': self.target,
-            'stop_loss': self.stop_loss,
-            'confidence_score': self.confluence_score,
-            'reason': ' | '.join(self.reasons)
-        }
+    confluence: int         # Kaç strateji onayladı
+    avg_score: float        # Ortalama güven skoru
+    timeframes: List[str]   # Hangi timeframe'lerden sinyal geldi
+    strategies: List[str]   # Hangi stratejiler tetikledi
+    reasons: List[str]      # Detaylı açıklamalar
+    is_mtf: bool            # Birden fazla timeframe'den mi geldi?
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+
+    @property
+    def final_score(self) -> float:
+        """MTF bonusu ile birlikte nihai skor"""
+        base = self.avg_score
+        if self.is_mtf:
+            base = min(1.0, base + 0.10)
+        return round(base, 2)
+
+    def summary(self) -> str:
+        """İnsan okunabilir özet"""
+        direction_emoji = "📈 BUY" if self.direction == "BUY" else "📉 SHORT"
+        mtf_tag = " [MTF✓]" if self.is_mtf else ""
+        tf_str = "+".join(sorted(set(self.timeframes)))
+
+        lines = [
+            f"{'='*50}",
+            f"{direction_emoji} | {self.symbol} | {tf_str}{mtf_tag}",
+            f"  Giriş  : {self.price:.6g}",
+            f"  Hedef  : {self.target:.6g}  ({self._pct(self.price, self.target):+.2f}%)",
+            f"  Stop   : {self.stop_loss:.6g}  ({self._pct(self.price, self.stop_loss):+.2f}%)",
+            f"  Skor   : {self.final_score:.0%}  |  Confluence: {self.confluence} strateji",
+            f"  Stratejiler: {', '.join(self.strategies)}",
+            "  Sebepler:",
+        ]
+        for r in self.reasons:
+            lines.append(f"    • {r}")
+        lines.append(f"{'='*50}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _pct(entry: float, other: float) -> float:
+        return (other - entry) / entry * 100 if entry else 0
 
 
 class SignalEngine:
-    """Runs all strategies and combines signals"""
-    
+    """Tüm stratejileri çalıştırır, MTF confluence hesaplar."""
+
     def __init__(self):
-        # Initialize all strategies
         self.strategies = [
-            ChannelBreakoutStrategy(),
-            RSIDivergenceStrategy(),
-            VolumeSpikeStrategy(),
-            EMACrossStrategy(),
-            SupportResistanceStrategy(),
-            MACDStrategy(),
+            RSIStochStrategy(),
             BollingerBandsStrategy(),
+            RSIDivergenceStrategy(),
+            VolumeConfirmStrategy(),
         ]
-        logger.info(f"Initialized {len(self.strategies)} strategies")
-    
-    def analyze_symbol(
+        logger.info(f"SignalEngine başlatıldı: {len(self.strategies)} strateji")
+
+    def analyze(
         self,
         symbol: str,
-        data: Dict[str, pd.DataFrame]
-    ) -> List[ConfluentSignal]:
+        data: Dict[str, pd.DataFrame],   # {timeframe: df}
+    ) -> List[FinalSignal]:
         """
-        Analyze a symbol across all timeframes and strategies
-        
-        Args:
-            symbol: Trading pair (e.g., BTC/USDT)
-            data: Dict of {timeframe: DataFrame}
-        
-        Returns:
-            List of confluent signals
+        Bir coin için tüm timeframe + strateji kombinasyonlarını çalıştır.
+        Returns: confluence eşiğini geçen FinalSignal listesi
         """
-        # 1. Market Structure Filter (Global Trend)
-        market_trend = self._get_market_trend(data)
-        
-        all_signals = []
-        
-        # Run each strategy on each timeframe
-        for timeframe, df in data.items():
-            if df is None or df.empty:
+        raw_signals: List[Signal] = []
+
+        for tf, df in data.items():
+            if df is None or df.empty or len(df) < 30:
                 continue
-            
             for strategy in self.strategies:
                 try:
-                    signal = strategy.analyze(df, symbol, timeframe)
-                    if signal:
-                        # 2. Filter signal based on market trend
-                        if self._is_aligned_with_market(signal, market_trend):
-                            all_signals.append(signal)
-                        else:
-                            logger.info(f"Filtered {signal.direction} signal for {symbol} due to market trend mismatch ({market_trend})")
-                except Exception as e:
-                    logger.error(f"Error in {strategy.name} for {symbol} {timeframe}: {e}")
-        
-        # 3. Calculate confluence and MTF
-        confluent_signals = self._calculate_confluence(all_signals)
-        
-        return confluent_signals
+                    sig = strategy.analyze(df, symbol, tf)
+                    if sig is not None:
+                        raw_signals.append(sig)
+                        logger.debug(
+                            f"[{symbol}][{tf}] {strategy.name}: "
+                            f"{sig.direction} skor={sig.score:.2f}"
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        f"[{symbol}][{tf}] {strategy.name} hata: {exc}"
+                    )
 
-    def _get_market_trend(self, data: Dict[str, pd.DataFrame]) -> str:
-        """Determine global market trend using BTC (if available) or current symbol"""
-        # In a real scenario, we'd fetch BTC/USDT specifically. 
-        # For now, let's look at the highest timeframe available (1d or 4h)
-        for tf in ['1d', '4h']:
-            if tf in data and len(data[tf]) > 200:
-                df = data[tf]
-                ema200 = EMAIndicator(close=df['close'], window=200).ema_indicator()
-                current_price = df['close'].iloc[-1]
-                current_ema = ema200.iloc[-1]
-                
-                if current_price > current_ema:
-                    return 'BULLISH'
-                else:
-                    return 'BEARISH'
-        
-        return 'NEUTRAL'
-
-    def _is_aligned_with_market(self, signal: Signal, market_trend: str) -> bool:
-        """Check if signal direction aligns with global market trend"""
-        if market_trend == 'NEUTRAL':
-            return True
-        if market_trend == 'BULLISH' and signal.direction == 'BUY':
-            return True
-        if market_trend == 'BEARISH' and signal.direction == 'SELL':
-            return True
-        return False
-    
-    def _calculate_confluence(self, signals: List[Signal]) -> List[ConfluentSignal]:
-        """Group signals by direction and calculate confluence"""
-        if not signals:
+        if not raw_signals:
             return []
-        
-        # Group by direction
-        buy_signals = [s for s in signals if s.direction == 'BUY']
-        sell_signals = [s for s in signals if s.direction == 'SELL']
-        
-        confluent_signals = []
-        
-        # Process BUY signals
-        if len(buy_signals) >= config.MIN_CONFLUENCE_SCORE:
-            confluent_signals.append(self._merge_signals(buy_signals, 'BUY'))
-        
-        # Process SELL signals
-        if len(sell_signals) >= config.MIN_CONFLUENCE_SCORE:
-            confluent_signals.append(self._merge_signals(sell_signals, 'SELL'))
-        
-        return confluent_signals
-    
-    def _merge_signals(self, signals: List[Signal], direction: str) -> ConfluentSignal:
-        """Merge multiple signals into one confluent signal"""
-        # Get unique strategies and timeframes
-        strategies = list(set(s.strategy for s in signals))
-        timeframes = list(set(s.timeframe for s in signals))
-        
-        # Create strategy-timeframe pairs for better display
-        strategy_details = []
-        for s in signals:
-            detail = f"{s.strategy} ({s.timeframe})" if len(signals) > 1 else s.strategy
-            strategy_details.append(detail)
-        
-        # Average price, target, stop_loss
-        avg_price = sum(s.price for s in signals) / len(signals)
-        avg_target = sum(s.target for s in signals) / len(signals)
-        avg_stop_loss = sum(s.stop_loss for s in signals) / len(signals)
-        avg_confidence = sum(s.confidence for s in signals) / len(signals)
-        
-        # Check for MTF (Multiple Timeframe Confirmation)
-        is_mtf = len(timeframes) >= 2
-        
-        merged_confidence = avg_confidence
-        if is_mtf:
-            merged_confidence = min(1.0, avg_confidence + 0.1)  # Bonus for MTF
-            reasons.append(f"MTF Confirmation ({', '.join(timeframes)})")
-            
-        return ConfluentSignal(
-            symbol=signals[0].symbol,
-            timeframe=', '.join(sorted(timeframes)),
-            strategies=strategy_details,
-            direction=direction,
-            price=avg_price,
-            target=avg_target,
-            stop_loss=avg_stop_loss,
-            confluence_score=len(signals),
-            confidence=merged_confidence,
-            reasons=reasons
-        )
-    
-    def analyze_all(
+
+        return self._build_final_signals(symbol, raw_signals)
+
+    def _build_final_signals(
+        self, symbol: str, signals: List[Signal]
+    ) -> List[FinalSignal]:
+        """Aynı yöndeki sinyalleri grupla, confluence hesapla."""
+        results: List[FinalSignal] = []
+
+        for direction in ("BUY", "SHORT"):
+            group = [s for s in signals if s.direction == direction]
+            if len(group) < config.MIN_CONFLUENCE:
+                continue
+
+            # Ağırlıklı ortalama fiyat (skora göre)
+            total_score = sum(s.score for s in group)
+            w_price = sum(s.price * s.score for s in group) / total_score
+            w_target = sum(s.target * s.score for s in group) / total_score
+            w_sl = sum(s.stop_loss * s.score for s in group) / total_score
+            avg_score = total_score / len(group)
+
+            timeframes = [s.timeframe for s in group]
+            unique_tfs = list(set(timeframes))
+            strategy_names = list(set(s.strategy for s in group))
+            reasons = [s.reason for s in group]
+            is_mtf = len(unique_tfs) >= 2
+
+            final = FinalSignal(
+                symbol=symbol,
+                direction=direction,
+                price=round(w_price, 8),
+                target=round(w_target, 8),
+                stop_loss=round(w_sl, 8),
+                confluence=len(group),
+                avg_score=round(avg_score, 2),
+                timeframes=timeframes,
+                strategies=strategy_names,
+                reasons=reasons,
+                is_mtf=is_mtf,
+            )
+            results.append(final)
+            logger.info(
+                f"[{symbol}] {direction} FinalSignal: "
+                f"confluence={len(group)} score={final.final_score:.0%} "
+                f"mtf={is_mtf} tfs={unique_tfs}"
+            )
+
+        return results
+
+    def analyze_batch(
         self,
         all_data: Dict[str, Dict[str, pd.DataFrame]],
-        max_workers: int = 10
-    ) -> List[ConfluentSignal]:
+    ) -> List[FinalSignal]:
         """
-        Analyze all symbols concurrently
-        
-        Args:
-            all_data: {symbol: {timeframe: DataFrame}}
-            max_workers: Number of concurrent workers
-        
-        Returns:
-            List of all confluent signals
+        Tüm coinleri analiz et.
+        all_data: {symbol: {timeframe: df}}
         """
-        all_signals = []
-        total_symbols = len(all_data)
-        
-        logger.info(f"Analyzing {total_symbols} symbols...")
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_symbol = {
-                executor.submit(self.analyze_symbol, symbol, data): symbol
-                for symbol, data in all_data.items()
-            }
-            
-            completed = 0
-            for future in as_completed(future_to_symbol):
-                symbol = future_to_symbol[future]
-                completed += 1
-                
-                try:
-                    signals = future.result()
-                    all_signals.extend(signals)
-                    
-                    if completed % 100 == 0:
-                        logger.info(f"Analyzed {completed}/{total_symbols} symbols, found {len(all_signals)} signals so far")
-                        
-                except Exception as e:
-                    logger.error(f"Error analyzing {symbol}: {e}")
-        
-        logger.info(f"Analysis complete: {len(all_signals)} signals from {total_symbols} symbols")
+        all_signals: List[FinalSignal] = []
+        total = len(all_data)
+
+        for idx, (symbol, data) in enumerate(all_data.items(), 1):
+            try:
+                sigs = self.analyze(symbol, data)
+                all_signals.extend(sigs)
+            except Exception as exc:
+                logger.error(f"[{symbol}] analiz hatası: {exc}")
+
+            if idx % 50 == 0:
+                logger.info(f"İlerleme: {idx}/{total} coin tarandı")
+
+        logger.info(
+            f"Tarama tamamlandı: {total} coin, "
+            f"{len(all_signals)} sinyal üretildi"
+        )
         return all_signals

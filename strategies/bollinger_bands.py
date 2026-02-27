@@ -1,85 +1,106 @@
 """
-Bollinger Bands Squeeze and Breakout Strategy
+Bollinger Bands Stratejisi
+━━━━━━━━━━━━━━━━━━━━━━━━━
+BUY  → Fiyat alt bandın altına düştü / alt bandı dokundu (dip bölge)
+SHORT→ Fiyat üst bandın üstüne çıktı / üst bandı dokundu (tepe bölge)
+
+Ek sinyal gücü: Squeeze sonrası patlama daha güvenilir
 """
 import pandas as pd
+import numpy as np
 from typing import Optional
-from ta.volatility import BollingerBands
+
 from .base_strategy import BaseStrategy, Signal
 import config
 
+
 class BollingerBandsStrategy(BaseStrategy):
-    """Detects Bollinger Bands squeeze and breakouts"""
-    
-    def __init__(self):
-        params = config.STRATEGY_PARAMS['bollinger_bands']
-        super().__init__(params)
-        self.name = "BollingerBandsStrategy"
-    
+
     def analyze(self, df: pd.DataFrame, symbol: str, timeframe: str) -> Optional[Signal]:
-        """Analyze for BB squeeze and breakout"""
-        if len(df) < self.params['period'] + 5:
+        period = config.BB_PERIOD
+        if len(df) < period + 5:
             return None
-            
-        bb = BollingerBands(
-            close=df['close'],
-            window=self.params['period'],
-            window_dev=self.params['std_dev']
-        )
-        
-        df_copy = df.copy()
-        df_copy['bb_high'] = bb.bollinger_hband()
-        df_copy['bb_low'] = bb.bollinger_lband()
-        df_copy['bb_mid'] = bb.bollinger_mavg()
-        
-        # Calculate bandwidth for squeeze detection
-        df_copy['bandwidth'] = (df_copy['bb_high'] - df_copy['bb_low']) / df_copy['bb_mid']
-        
-        current = df_copy.iloc[-1]
-        previous = df_copy.iloc[-2]
-        
-        # Squeeze detection: bandwidth is low
-        is_squeeze = current['bandwidth'] < self.params['squeeze_threshold']
-        
-        # Bullish Breakout
-        if current['close'] > current['bb_high'] and previous['close'] <= previous['bb_high']:
-            target, stop_loss = self.calculate_target_stop(
-                current['close'],
-                'BUY',
-                stop_percent=config.DEFAULT_STOP_LOSS_PERCENT
-            )
-            
-            squeeze_text = " after Squeeze" if is_squeeze else ""
+
+        close = df["close"]
+        mid = close.rolling(period).mean()
+        std = close.rolling(period).std()
+        upper = mid + config.BB_STD * std
+        lower = mid - config.BB_STD * std
+        bandwidth = (upper - lower) / mid  # göreceli bant genişliği
+
+        atr_series = self.calc_atr(df, config.ATR_PERIOD)
+
+        cur = df.iloc[-1]
+        prev = df.iloc[-2]
+        cur_price = float(cur["close"])
+        atr = float(atr_series.iloc[-1])
+
+        cur_upper = float(upper.iloc[-1])
+        cur_lower = float(lower.iloc[-1])
+        cur_mid = float(mid.iloc[-1])
+        prev_upper = float(upper.iloc[-2])
+        prev_lower = float(lower.iloc[-2])
+        cur_bw = float(bandwidth.iloc[-1])
+
+        # Sıkışma (squeeze) tespiti: bant genişliği eşiğin altındaysa
+        is_squeeze = cur_bw < config.BB_SQUEEZE_THRESHOLD
+        squeeze_bonus = 0.10 if is_squeeze else 0.0
+
+        if pd.isna(cur_upper) or pd.isna(cur_lower) or atr == 0:
+            return None
+
+        # ── BUY: Alt bandın altına düşüş (oversold bölge) ──────────
+        # Mum alt bandı aşağı kesti (önceki mum üstteydi)
+        if (float(prev["close"]) >= prev_lower and
+                cur_price <= cur_lower):
+
+            score = min(1.0, 0.70 + squeeze_bonus)
+            # Bandın ne kadar altındayız?
+            depth_pct = (cur_lower - cur_price) / cur_lower
+            score = min(1.0, score + depth_pct * 2)
+
+            target, stop_loss = self.calc_tp_sl(cur_price, "BUY", atr)
+
+            reason = "BB Alt Band Kırıldı"
+            if is_squeeze:
+                reason += " (Squeeze Sonrası)"
+
             return Signal(
                 symbol=symbol,
                 timeframe=timeframe,
                 strategy=self.name,
-                direction='BUY',
-                price=float(current['close']),
-                target=float(target),
-                stop_loss=float(stop_loss),
-                confidence=0.85 if is_squeeze else 0.75,
-                reason=f"Bollinger Top Breakout{squeeze_text}"
+                direction="BUY",
+                price=cur_price,
+                target=target,
+                stop_loss=stop_loss,
+                score=round(score, 2),
+                reason=f"{reason} | Lower={cur_lower:.4f} | BW={cur_bw:.3f}",
             )
-            
-        # Bearish Breakout
-        if current['close'] < current['bb_low'] and previous['close'] >= previous['bb_low']:
-            target, stop_loss = self.calculate_target_stop(
-                current['close'],
-                'SELL',
-                stop_percent=config.DEFAULT_STOP_LOSS_PERCENT
-            )
-            
-            squeeze_text = " after Squeeze" if is_squeeze else ""
+
+        # ── SHORT: Üst bandın üstüne çıkış (overbought bölge) ──────
+        if (float(prev["close"]) <= prev_upper and
+                cur_price >= cur_upper):
+
+            score = min(1.0, 0.70 + squeeze_bonus)
+            depth_pct = (cur_price - cur_upper) / cur_upper
+            score = min(1.0, score + depth_pct * 2)
+
+            target, stop_loss = self.calc_tp_sl(cur_price, "SHORT", atr)
+
+            reason = "BB Üst Band Kırıldı"
+            if is_squeeze:
+                reason += " (Squeeze Sonrası)"
+
             return Signal(
                 symbol=symbol,
                 timeframe=timeframe,
                 strategy=self.name,
-                direction='SELL',
-                price=float(current['close']),
-                target=float(target),
-                stop_loss=float(stop_loss),
-                confidence=0.85 if is_squeeze else 0.75,
-                reason=f"Bollinger Bottom Breakout{squeeze_text}"
+                direction="SHORT",
+                price=cur_price,
+                target=target,
+                stop_loss=stop_loss,
+                score=round(score, 2),
+                reason=f"{reason} | Upper={cur_upper:.4f} | BW={cur_bw:.3f}",
             )
-            
+
         return None
